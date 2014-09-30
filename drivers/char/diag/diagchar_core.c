@@ -39,6 +39,14 @@
 #include "diagfwd_smux.h"
 #endif
 #include <linux/timer.h>
+#ifdef CONFIG_LGE_USB_DIAG_DISABLE
+#include <linux/platform_device.h>
+#include "diag_lock.h"
+#endif
+
+#ifdef CONFIG_LGE_USB_DIAG_DISABLE_ONLY_MDM
+#include <mach/board_lge.h>
+#endif
 #include "diag_debugfs.h"
 #include "diag_masks.h"
 #include "diagfwd_bridge.h"
@@ -1374,6 +1382,11 @@ exit:
 				&driver->smd_data[i].nrt_lock);
 	}
 	mutex_unlock(&driver->diagchar_mutex);
+
+#ifdef CONFIG_USB_G_LGE_ANDROID_DIAG_OSP_SUPPORT
+	driver->diag_read_status = 1;
+	wake_up_interruptible(&driver->diag_read_wait_q);
+#endif
 	return ret;
 }
 
@@ -1382,6 +1395,14 @@ static int diagchar_write(struct file *file, const char __user *buf,
 {
 	int err, ret = 0, pkt_type, token_offset = 0;
 	int remote_proc = 0, index;
+#ifdef CONFIG_LGE_DM_DEV
+	char *buf_dev;
+#endif /*                 */
+//                                                                           
+#ifdef CONFIG_LGE_DM_APP
+	char *buf_cmp;
+#endif
+#ifndef CONFIG_USB_G_LGE_ANDROID
 #ifdef DIAG_DEBUG
 	int length = 0, i;
 #endif
@@ -1409,7 +1430,23 @@ static int diagchar_write(struct file *file, const char __user *buf,
 				payload_size);
 		driver->dropped_count++;
 		return -EBADMSG;
+        }
+#ifdef CONFIG_LGE_DM_APP
+	if (driver->logging_mode == DM_APP_MODE) {
+		/* only diag cmd #250 for supporting testmode tool */
+		buf_cmp = (char *)buf + 4;
+		if (*(buf_cmp) != 0xFA)
+			return 0;
 	}
+#endif
+#ifdef CONFIG_LGE_DM_DEV
+	if (driver->logging_mode == DM_DEV_MODE) {
+		/* only diag cmd #250 for supporting testmode tool */
+		buf_dev = (char *)buf + 4;
+		if (*(buf_dev) != 0xFA)
+			return 0;
+	}
+#endif
 #ifdef CONFIG_DIAG_OVER_USB
 	if (((pkt_type != DCI_DATA_TYPE) && (driver->logging_mode == USB_MODE)
 				&& (!driver->usb_connected)) ||
@@ -1608,9 +1645,13 @@ static int diagchar_write(struct file *file, const char __user *buf,
 		buf = buf + 4;
 #ifdef DIAG_DEBUG
 		pr_debug("diag: user space data %d\n", payload_size);
+#ifdef CONFIG_USB_G_LGE_ANDROID
+        print_hex_dump(KERN_DEBUG, "", DUMP_PREFIX_OFFSET, 16, 1, driver->user_space_data, payload_size, 1);
+#else
 		for (i = 0; i < payload_size; i++)
 			pr_debug("\t %x", *((user_space_data
 						+ token_offset)+i));
+#endif
 #endif
 #ifdef CONFIG_DIAG_SDIO_PIPE
 		/* send masks to 9k too */
@@ -1714,8 +1755,12 @@ static int diagchar_write(struct file *file, const char __user *buf,
 	}
 #ifdef DIAG_DEBUG
 	printk(KERN_DEBUG "data is -->\n");
+#ifdef CONFIG_USB_G_LGE_ANDROID
+    print_hex_dump(KERN_DEBUG, "", DUMP_PREFIX_OFFSET, 16, 1, buf_copy, payload_size, 1);
+#else
 	for (i = 0; i < payload_size; i++)
 		printk(KERN_DEBUG "\t %x \t", *(((unsigned char *)buf_copy)+i));
+#endif /*                          */
 #endif
 	send.state = DIAG_STATE_START;
 	send.pkt = buf_copy;
@@ -1724,12 +1769,19 @@ static int diagchar_write(struct file *file, const char __user *buf,
 #ifdef DIAG_DEBUG
 	pr_debug("diag: Already used bytes in buffer %d, and"
 	" incoming payload size is %d\n", driver->used, payload_size);
+#ifdef CONFIG_USB_G_LGE_ANDROID
+    if (buf_hdlc) {
+        printk(KERN_DEBUG "hdlc encoded data is -->\n");
+        print_hex_dump(KERN_DEBUG, "", DUMP_PREFIX_OFFSET, 16, 1, buf_hdlc, payload_size + 8, 1);
+    }
+#else
 	printk(KERN_DEBUG "hdlc encoded data is -->\n");
 	for (i = 0; i < payload_size + 8; i++) {
 		printk(KERN_DEBUG "\t %x \t", *(((unsigned char *)buf_hdlc)+i));
 		if (*(((unsigned char *)buf_hdlc)+i) != 0x7e)
 			length++;
 	}
+#endif /*                          */
 #endif
 	mutex_lock(&driver->diagchar_mutex);
 	if (!buf_hdlc)
@@ -1996,6 +2048,88 @@ void diagfwd_bridge_fn(int type)
 #else
 inline void diagfwd_bridge_fn(int type) { }
 #endif
+#ifdef CONFIG_LGE_USB_DIAG_DISABLE
+extern void diagfwd_enable(int enable);
+extern void diagfwd_hsic_enable(int enable);
+
+static void diag_enable(int enable)
+{
+#ifdef CONFIG_LGE_USB_DIAG_DISABLE_ONLY_MDM
+    if(lge_get_factory_boot())
+    {
+        pr_info("diag_lock : force to enable, pifcable\n");
+        diagfwd_hsic_enable(DIAG_ENABLE);
+    }
+    else
+    {
+        pr_info("diag_lock : enable = %d, pifcable is not\n", enable);
+        set_diag_state(enable);
+        diagfwd_hsic_enable(enable);
+    }
+#else
+        set_diag_state(enable);
+        diagfwd_enable(enable);
+        diagfwd_hsic_enable(enable);
+#endif
+}
+
+static ssize_t read_diag_enable(struct device *dev,
+        struct device_attribute *attr,
+        char *buf)
+{
+    return sprintf(buf, "%d", diag_state());
+}
+
+static ssize_t write_diag_enable(struct device *dev,
+        struct device_attribute *attr,
+        const char *buf, size_t size)
+{
+    char *p;
+
+    p = strchr(buf, '\n');
+    if (p) *p = '\0';
+
+    if (!strcmp(buf, "1"))
+        diag_enable(DIAG_ENABLE);
+    else if (!strcmp(buf, "0"))
+        diag_enable(DIAG_DISABLE);
+    else
+        pr_err("%s: unknown value\n", __func__);
+
+    return size;
+}
+
+static DEVICE_ATTR(diag_enable, S_IRUGO | S_IWUSR, read_diag_enable, write_diag_enable);
+
+static int lg_diag_cmd_probe(struct platform_device *pdev)
+{
+    int ret;
+
+    /* /sys/devices/platform/lg_diag_cmd/diag_enable */
+    ret = device_create_file(&pdev->dev, &dev_attr_diag_enable);
+    if (ret) {
+        pr_err("%s: create fail diag_enable\n", __func__);
+        device_remove_file(&pdev->dev, &dev_attr_diag_enable);
+    }
+
+    return ret;
+}
+
+static int lg_diag_cmd_remove(struct platform_device *pdev)
+{
+    device_remove_file(&pdev->dev, &dev_attr_diag_enable);
+    return 0;
+}
+
+static struct platform_driver lg_diag_cmd_driver = {
+    .probe		= lg_diag_cmd_probe,
+    .remove 	= lg_diag_cmd_remove,
+    .driver 	= {
+        .name = "lg_diag_cmd",
+        .owner	= THIS_MODULE,
+    },
+};
+#endif /*                             */
 
 static int __init diagchar_init(void)
 {
@@ -2045,8 +2179,15 @@ static int __init diagchar_init(void)
 		diagfwd_init();
 #ifdef CONFIG_DIAGFWD_BRIDGE_CODE
 		spin_lock_init(&driver->hsic_ready_spinlock);
+
+
 		diagfwd_bridge_init(HSIC);
 		diagfwd_bridge_init(HSIC_2);
+                //
+#if defined(CONFIG_LGE_DM_DEV) || defined(CONFIG_LGE_DM_APP)
+		diagfwd_bridge_init(HSIC_3);
+		diagfwd_bridge_init(HSIC_4);
+#endif /*                   */
 		/* register HSIC device */
 		ret = platform_driver_register(&msm_hsic_ch_driver);
 		if (ret)
@@ -2085,6 +2226,10 @@ static int __init diagchar_init(void)
 		printk(KERN_INFO "kzalloc failed\n");
 		goto fail;
 	}
+
+#ifdef CONFIG_LGE_USB_DIAG_DISABLE
+	platform_driver_register(&lg_diag_cmd_driver);
+#endif
 
 	pr_info("diagchar initialized now");
 	return 0;
