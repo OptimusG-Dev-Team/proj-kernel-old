@@ -514,6 +514,8 @@ static int device_resume_early(struct device *dev, pm_message_t state)
 	error = dpm_run_callback(callback, dev, state, info);
 
 	TRACE_RESUME(error);
+
+	pm_runtime_enable(dev);
 	return error;
 }
 
@@ -937,6 +939,8 @@ static int device_suspend_late(struct device *dev, pm_message_t state)
 {
 	pm_callback_t callback = NULL;
 	char *info = NULL;
+
+	__pm_runtime_disable(dev, false);
 
 	if (dev->pm_domain) {
 		info = "late power domain ";
